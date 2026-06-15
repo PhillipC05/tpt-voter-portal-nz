@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { QRCode } from "@tpt-nz/ui-shared";
 
 interface Poll {
   id: string;
@@ -29,10 +30,8 @@ export default function BallotForm({ poll, onVote }: BallotFormProps) {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (selected === null) return;
-
     setSubmitting(true);
     setError(null);
-
     try {
       const rec = await onVote(selected);
       setReceipt(rec);
@@ -44,6 +43,7 @@ export default function BallotForm({ poll, onVote }: BallotFormProps) {
   };
 
   if (receipt) {
+    const verifyUrl = `${typeof window !== "undefined" ? window.location.origin : ""}/results/${poll.id}?receipt=${encodeURIComponent(receipt.receiptToken)}`;
     return (
       <div className="bg-green-50 border border-green-200 rounded-lg p-6">
         <h2 className="text-lg font-semibold text-green-800 mb-2">
@@ -57,10 +57,18 @@ export default function BallotForm({ poll, onVote }: BallotFormProps) {
         <p className="text-sm text-green-700 mb-4">
           Save your receipt token to verify your vote in the public audit:
         </p>
-        <div className="bg-white rounded border border-green-200 p-3 font-mono text-sm text-gray-800 break-all">
+        <div className="bg-white rounded border border-green-200 p-3 font-mono text-sm text-gray-800 break-all mb-4">
           {receipt.receiptToken}
         </div>
-        <p className="text-xs text-gray-500 mt-2">
+        <div className="flex flex-col items-center gap-2 mb-4">
+          <QRCode
+            value={verifyUrl}
+            size={160}
+            label="Scan to verify your vote"
+            errorCorrectionLevel="M"
+          />
+        </div>
+        <p className="text-xs text-gray-500">
           Cast at{" "}
           {new Date(receipt.castAt).toLocaleString("en-NZ", {
             day: "numeric",

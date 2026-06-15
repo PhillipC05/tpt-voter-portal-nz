@@ -3,6 +3,9 @@
 import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import BallotForm from "@/components/BallotForm";
+import RankedBallotForm from "@/components/RankedBallotForm";
+import CountdownTimer from "@/components/CountdownTimer";
+import { QRCode } from "@tpt-nz/ui-shared";
 
 interface Poll {
   id: string;
@@ -12,6 +15,7 @@ interface Poll {
   status: string;
   opensAt: string;
   closesAt: string;
+  ballotType: string;
 }
 
 interface BallotReceipt {
@@ -65,7 +69,6 @@ export default function PollPage() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ choiceIndex }),
     });
-
     if (res.status === 401)
       throw new Error("Please sign in with RealMe to vote.");
     if (res.status === 403)
@@ -76,7 +79,27 @@ export default function PollPage() {
       const data = await res.json();
       throw new Error(data.error || "Vote failed");
     }
+    const rec: BallotReceipt = await res.json();
+    setReceipt(rec);
+    return rec;
+  };
 
+  const handleRankedVote = async (rankings: number[]): Promise<BallotReceipt> => {
+    const res = await fetch(`/polls/${pollId}/vote`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rankings }),
+    });
+    if (res.status === 401)
+      throw new Error("Please sign in with RealMe to vote.");
+    if (res.status === 403)
+      throw new Error(
+        "You must register as a voter before casting a ballot. Visit /register first."
+      );
+    if (!res.ok) {
+      const data = await res.json();
+      throw new Error(data.error || "Vote failed");
+    }
     const rec: BallotReceipt = await res.json();
     setReceipt(rec);
     return rec;
@@ -100,6 +123,10 @@ export default function PollPage() {
     );
   }
 
+  const verifyUrl = receipt
+    ? `${typeof window !== "undefined" ? window.location.origin : ""}/results/${poll.id}?receipt=${encodeURIComponent(receipt.receiptToken)}`
+    : null;
+
   return (
     <div className="max-w-2xl mx-auto px-4 sm:px-6 py-12">
       <div className="mb-2">
@@ -111,18 +138,28 @@ export default function PollPage() {
         {poll.title}
       </h1>
       {poll.description && (
-        <p className="text-gray-600 mb-6">{poll.description}</p>
+        <p className="text-gray-600 mb-4">{poll.description}</p>
       )}
 
-      <div className="text-sm text-gray-500 mb-8">
-        Closes{" "}
-        {new Date(poll.closesAt).toLocaleDateString("en-NZ", {
-          day: "numeric",
-          month: "long",
-          year: "numeric",
-          hour: "2-digit",
-          minute: "2-digit",
-        })}
+      <div className="flex items-center gap-3 text-sm text-gray-500 mb-8">
+        <span>
+          Closes{" "}
+          {new Date(poll.closesAt).toLocaleDateString("en-NZ", {
+            day: "numeric",
+            month: "long",
+            year: "numeric",
+          })}
+        </span>
+        <span aria-hidden="true">·</span>
+        <CountdownTimer closesAt={poll.closesAt} />
+        {poll.ballotType === "ranked" && (
+          <>
+            <span aria-hidden="true">·</span>
+            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
+              Ranked choice
+            </span>
+          </>
+        )}
       </div>
 
       {receipt ? (
@@ -134,10 +171,20 @@ export default function PollPage() {
             Your ballot has been recorded. Keep your receipt token to verify
             your vote in the public audit.
           </p>
-          <div className="bg-white rounded border border-green-200 p-3 font-mono text-sm text-gray-800 break-all">
+          <div className="bg-white rounded border border-green-200 p-3 font-mono text-sm text-gray-800 break-all mb-4">
             {receipt.receiptToken}
           </div>
-          <div className="mt-4 flex gap-3 flex-wrap">
+          {verifyUrl && (
+            <div className="flex flex-col items-center gap-2 mb-5">
+              <QRCode
+                value={verifyUrl}
+                size={160}
+                label="Scan to verify your vote"
+                errorCorrectionLevel="M"
+              />
+            </div>
+          )}
+          <div className="flex gap-3 flex-wrap">
             <a
               href={`/results/${poll.id}`}
               className="text-sm text-blue-600 hover:text-blue-800 font-medium"
@@ -145,7 +192,7 @@ export default function PollPage() {
               View Results →
             </a>
             <a
-              href={`/results/${poll.id}?receipt=${receipt.receiptToken}`}
+              href={`/results/${poll.id}?receipt=${encodeURIComponent(receipt.receiptToken)}`}
               className="text-sm text-blue-600 hover:text-blue-800 font-medium"
             >
               Verify Your Vote →
@@ -162,6 +209,8 @@ export default function PollPage() {
             View results →
           </a>
         </div>
+      ) : poll.ballotType === "ranked" ? (
+        <RankedBallotForm poll={poll} onVote={handleRankedVote} />
       ) : (
         <BallotForm poll={poll} onVote={handleVote} />
       )}

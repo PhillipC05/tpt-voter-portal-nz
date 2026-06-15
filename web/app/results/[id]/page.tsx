@@ -5,6 +5,17 @@ import { useParams, useSearchParams } from "next/navigation";
 import ResultsChart from "@/components/ResultsChart";
 import AuditProofDisplay from "@/components/AuditProofDisplay";
 
+interface IRVRound {
+  counts: Record<string, number>;
+  eliminated: number[];
+  totalActive: number;
+}
+
+interface IRVResult {
+  winner: number | null;
+  rounds: IRVRound[];
+}
+
 interface Tally {
   poll: {
     id: string;
@@ -18,6 +29,7 @@ interface Tally {
   totalVotes: number;
   auditRoot: string;
   computedAt: string;
+  irvResult?: IRVResult;
 }
 
 interface VerifyResult {
