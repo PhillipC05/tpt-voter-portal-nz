@@ -54,7 +54,6 @@ func (h *AuthHandler) Status(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"authenticated": true,
 		"identity": map[string]interface{}{
-			"flt":        identity.FLT,
 			"fullName":   identity.FullName,
 			"assurance":  identity.AssuranceLevel.String(),
 			"isVerified": identity.IsVerified(),

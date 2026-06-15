@@ -7,7 +7,6 @@
 *.test
 *.out
 /vendor/
-go.sum
 
 # Certificates and keys — NEVER commit real certs
 *.pem

@@ -11,10 +11,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/tpt-nz/tpt-voter-portal-nz/internal/models"
 	"github.com/tpt-nz/realme-go"
 )
+
+// withPollID injects a chi route parameter "id" into the request context.
+func withPollID(r *http.Request, id string) *http.Request {
+	chiCtx := chi.NewRouteContext()
+	chiCtx.URLParams.Add("id", id)
+	return r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, chiCtx))
+}
 
 // --- Mock implementations ---
 
@@ -47,11 +55,11 @@ func (m *mockPollService) GetPollByID(ctx context.Context, id uuid.UUID) (*model
 	return nil, nil
 }
 
-func (m *mockPollService) CastBallot(ctx context.Context, flt string, pollID uuid.UUID, choiceIndex int) (*models.BallotReceipt, error) {
+func (m *mockPollService) CastBallot(ctx context.Context, flt string, pollID uuid.UUID, req *models.CastBallotRequest) (*models.BallotReceipt, error) {
 	if m.castBallotFn != nil {
-		return m.castBallotFn(ctx, flt, pollID, choiceIndex)
+		return m.castBallotFn(ctx, flt, pollID, req.ChoiceIndex)
 	}
-	return &models.BallotReceipt{ReceiptToken: "test-receipt", PollID: pollID, ChoiceIndex: choiceIndex, CastAt: time.Now()}, nil
+	return &models.BallotReceipt{ReceiptToken: "test-receipt", PollID: pollID, ChoiceIndex: req.ChoiceIndex, CastAt: time.Now()}, nil
 }
 
 func (m *mockPollService) GetVoterReceipt(ctx context.Context, flt string, pollID uuid.UUID) (*models.BallotReceipt, error) {
@@ -97,10 +105,12 @@ func TestPollHandler_CastBallot_NotEligible(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	h := NewPollHandler(&mockPollService{}, &mockRegService{eligible: false}, logger)
 
-	req := httptest.NewRequest(http.MethodPost, "/polls/"+uuid.New().String()+"/vote",
+	pollID := uuid.New().String()
+	req := httptest.NewRequest(http.MethodPost, "/polls/"+pollID+"/vote",
 		bytes.NewBufferString(`{"choiceIndex":0}`))
 	req.Header.Set("Content-Type", "application/json")
 	req = withIdentity(req)
+	req = withPollID(req, pollID)
 
 	w := httptest.NewRecorder()
 	h.CastBallot(w, req)
@@ -138,7 +148,9 @@ func TestPollHandler_GetByID_NotFound(t *testing.T) {
 	}
 	h := NewPollHandler(svc, &mockRegService{}, logger)
 
-	req := httptest.NewRequest(http.MethodGet, "/polls/"+uuid.New().String(), nil)
+	pollID := uuid.New().String()
+	req := httptest.NewRequest(http.MethodGet, "/polls/"+pollID, nil)
+	req = withPollID(req, pollID)
 	w := httptest.NewRecorder()
 	h.GetByID(w, req)
 

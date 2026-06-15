@@ -13,6 +13,9 @@ import (
 	"github.com/tpt-nz/tpt-voter-portal-nz/internal/models"
 )
 
+// DefaultAuditPageSize is the number of audit entries returned per page.
+const DefaultAuditPageSize = 100
+
 // VoterRepository handles all database operations for voters, polls, ballots, and tallies.
 type VoterRepository struct {
 	pool *pgxpool.Pool
@@ -66,17 +69,21 @@ func (r *VoterRepository) CreatePoll(ctx context.Context, p *models.Poll) error 
 	p.ID = uuid.New()
 	p.CreatedAt = time.Now().UTC()
 
+	if p.BallotType == "" {
+		p.BallotType = models.BallotTypeFPTP
+	}
+
 	optionsJSON, err := json.Marshal(p.Options)
 	if err != nil {
 		return fmt.Errorf("voter_repo: marshal poll options: %w", err)
 	}
 
 	query := `
-		INSERT INTO polls (id, title, description, options, status, poll_salt, opens_at, closes_at, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`
+		INSERT INTO polls (id, title, description, options, ballot_type, status, poll_salt, opens_at, closes_at, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
 
 	_, err = r.pool.Exec(ctx, query,
-		p.ID, p.Title, p.Description, string(optionsJSON),
+		p.ID, p.Title, p.Description, string(optionsJSON), string(p.BallotType),
 		p.Status, p.PollSalt, p.OpensAt, p.ClosesAt, p.CreatedAt,
 	)
 	if err != nil {
@@ -88,13 +95,13 @@ func (r *VoterRepository) CreatePoll(ctx context.Context, p *models.Poll) error 
 // GetPollByID retrieves a poll by its UUID. Returns nil if not found.
 func (r *VoterRepository) GetPollByID(ctx context.Context, id uuid.UUID) (*models.Poll, error) {
 	query := `
-		SELECT id, title, description, options, status, poll_salt, opens_at, closes_at, created_at
+		SELECT id, title, description, options, ballot_type, status, poll_salt, opens_at, closes_at, created_at
 		FROM polls WHERE id = $1`
 
 	p := &models.Poll{}
-	var optionsJSON string
+	var optionsJSON, ballotType string
 	err := r.pool.QueryRow(ctx, query, id).Scan(
-		&p.ID, &p.Title, &p.Description, &optionsJSON,
+		&p.ID, &p.Title, &p.Description, &optionsJSON, &ballotType,
 		&p.Status, &p.PollSalt, &p.OpensAt, &p.ClosesAt, &p.CreatedAt,
 	)
 	if err != nil {
@@ -103,6 +110,7 @@ func (r *VoterRepository) GetPollByID(ctx context.Context, id uuid.UUID) (*model
 		}
 		return nil, fmt.Errorf("voter_repo: get poll by id %s: %w", id, err)
 	}
+	p.BallotType = models.BallotType(ballotType)
 	if err := json.Unmarshal([]byte(optionsJSON), &p.Options); err != nil {
 		return nil, fmt.Errorf("voter_repo: unmarshal poll options: %w", err)
 	}
@@ -112,7 +120,7 @@ func (r *VoterRepository) GetPollByID(ctx context.Context, id uuid.UUID) (*model
 // GetActivePolls returns all polls currently open for voting, ordered by opens_at.
 func (r *VoterRepository) GetActivePolls(ctx context.Context) ([]models.Poll, error) {
 	query := `
-		SELECT id, title, description, options, status, poll_salt, opens_at, closes_at, created_at
+		SELECT id, title, description, options, ballot_type, status, poll_salt, opens_at, closes_at, created_at
 		FROM polls WHERE status = 'open' ORDER BY opens_at DESC`
 
 	return r.scanPolls(ctx, query)
@@ -121,7 +129,7 @@ func (r *VoterRepository) GetActivePolls(ctx context.Context) ([]models.Poll, er
 // GetAllPolls returns all polls regardless of status.
 func (r *VoterRepository) GetAllPolls(ctx context.Context) ([]models.Poll, error) {
 	query := `
-		SELECT id, title, description, options, status, poll_salt, opens_at, closes_at, created_at
+		SELECT id, title, description, options, ballot_type, status, poll_salt, opens_at, closes_at, created_at
 		FROM polls ORDER BY created_at DESC`
 
 	return r.scanPolls(ctx, query)
@@ -136,6 +144,30 @@ func (r *VoterRepository) UpdatePollStatus(ctx context.Context, id uuid.UUID, st
 	return nil
 }
 
+// OpenDraftPolls transitions all draft polls whose opens_at <= now to 'open'.
+// Returns the number of polls opened.
+func (r *VoterRepository) OpenDraftPolls(ctx context.Context) (int64, error) {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE polls SET status = 'open' WHERE status = 'draft' AND opens_at <= now()`,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("voter_repo: open draft polls: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// CloseExpiredPolls transitions all open polls whose closes_at <= now to 'closed'.
+// Returns the number of polls closed.
+func (r *VoterRepository) CloseExpiredPolls(ctx context.Context) (int64, error) {
+	tag, err := r.pool.Exec(ctx,
+		`UPDATE polls SET status = 'closed' WHERE status = 'open' AND closes_at <= now()`,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("voter_repo: close expired polls: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (r *VoterRepository) scanPolls(ctx context.Context, query string, args ...interface{}) ([]models.Poll, error) {
 	rows, err := r.pool.Query(ctx, query, args...)
 	if err != nil {
@@ -146,13 +178,14 @@ func (r *VoterRepository) scanPolls(ctx context.Context, query string, args ...i
 	var polls []models.Poll
 	for rows.Next() {
 		var p models.Poll
-		var optionsJSON string
+		var optionsJSON, ballotType string
 		if err := rows.Scan(
-			&p.ID, &p.Title, &p.Description, &optionsJSON,
+			&p.ID, &p.Title, &p.Description, &optionsJSON, &ballotType,
 			&p.Status, &p.PollSalt, &p.OpensAt, &p.ClosesAt, &p.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("voter_repo: scan poll: %w", err)
 		}
+		p.BallotType = models.BallotType(ballotType)
 		if err := json.Unmarshal([]byte(optionsJSON), &p.Options); err != nil {
 			return nil, fmt.Errorf("voter_repo: unmarshal poll options: %w", err)
 		}
@@ -169,12 +202,23 @@ func (r *VoterRepository) InsertBallot(ctx context.Context, b *models.Ballot) er
 	b.ID = uuid.New()
 	b.CastAt = time.Now().UTC()
 
+	var rankingsJSON *string
+	if len(b.Rankings) > 0 {
+		raw, err := json.Marshal(b.Rankings)
+		if err != nil {
+			return fmt.Errorf("voter_repo: marshal rankings: %w", err)
+		}
+		s := string(raw)
+		rankingsJSON = &s
+	}
+
 	query := `
-		INSERT INTO ballots (id, poll_id, voter_token, choice_index, receipt_token, commitment, cast_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`
+		INSERT INTO ballots (id, poll_id, voter_token, choice_index, rankings, receipt_token, commitment, cast_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
 
 	_, err := r.pool.Exec(ctx, query,
-		b.ID, b.PollID, b.VoterToken, b.ChoiceIndex, b.ReceiptToken, b.Commitment, b.CastAt,
+		b.ID, b.PollID, b.VoterToken, b.ChoiceIndex, rankingsJSON,
+		b.ReceiptToken, b.Commitment, b.CastAt,
 	)
 	if err != nil {
 		return fmt.Errorf("voter_repo: insert ballot: %w", err)
@@ -212,23 +256,52 @@ func (r *VoterRepository) GetReceiptByVoterToken(ctx context.Context, pollID uui
 	return rec, nil
 }
 
-// GetBallotsByPoll returns all ballots for a poll (for audit purposes).
+// GetBallotsByPoll returns all ballots for a poll (used by tally and audit).
 func (r *VoterRepository) GetBallotsByPoll(ctx context.Context, pollID uuid.UUID) ([]models.Ballot, error) {
 	query := `
-		SELECT id, poll_id, voter_token, choice_index, receipt_token, commitment, cast_at
+		SELECT id, poll_id, voter_token, choice_index, rankings, receipt_token, commitment, cast_at
 		FROM ballots WHERE poll_id = $1 ORDER BY cast_at ASC`
 
 	rows, err := r.pool.Query(ctx, query, pollID)
+	return r.scanBallots(ctx, rows, err)
+}
+
+// GetBallotsByPollPaginated returns a page of ballots for the audit endpoint.
+func (r *VoterRepository) GetBallotsByPollPaginated(ctx context.Context, pollID uuid.UUID, offset, limit int) ([]models.Ballot, int, error) {
+	var total int
+	if err := r.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM ballots WHERE poll_id = $1`, pollID,
+	).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("voter_repo: count ballots: %w", err)
+	}
+
+	query := `
+		SELECT id, poll_id, voter_token, choice_index, rankings, receipt_token, commitment, cast_at
+		FROM ballots WHERE poll_id = $1 ORDER BY cast_at ASC
+		LIMIT $2 OFFSET $3`
+
+	rows, err := r.pool.Query(ctx, query, pollID, limit, offset)
+	ballots, scanErr := r.scanBallots(ctx, rows, err)
+	return ballots, total, scanErr
+}
+
+func (r *VoterRepository) scanBallots(ctx context.Context, rows pgx.Rows, err error) ([]models.Ballot, error) {
 	if err != nil {
-		return nil, fmt.Errorf("voter_repo: get ballots by poll: %w", err)
+		return nil, fmt.Errorf("voter_repo: get ballots: %w", err)
 	}
 	defer rows.Close()
 
 	var ballots []models.Ballot
 	for rows.Next() {
 		var b models.Ballot
-		if err := rows.Scan(&b.ID, &b.PollID, &b.VoterToken, &b.ChoiceIndex, &b.ReceiptToken, &b.Commitment, &b.CastAt); err != nil {
+		var rankingsJSON *string
+		if err := rows.Scan(&b.ID, &b.PollID, &b.VoterToken, &b.ChoiceIndex, &rankingsJSON, &b.ReceiptToken, &b.Commitment, &b.CastAt); err != nil {
 			return nil, fmt.Errorf("voter_repo: scan ballot: %w", err)
+		}
+		if rankingsJSON != nil {
+			if err := json.Unmarshal([]byte(*rankingsJSON), &b.Rankings); err != nil {
+				return nil, fmt.Errorf("voter_repo: unmarshal rankings: %w", err)
+			}
 		}
 		ballots = append(ballots, b)
 	}
@@ -260,18 +333,25 @@ func (r *VoterRepository) CountVotesByPoll(ctx context.Context, pollID uuid.UUID
 // GetBallotByReceiptToken looks up a ballot by its public receipt token.
 func (r *VoterRepository) GetBallotByReceiptToken(ctx context.Context, receiptToken string) (*models.Ballot, error) {
 	query := `
-		SELECT id, poll_id, voter_token, choice_index, receipt_token, commitment, cast_at
+		SELECT id, poll_id, voter_token, choice_index, rankings, receipt_token, commitment, cast_at
 		FROM ballots WHERE receipt_token = $1`
 
 	b := &models.Ballot{}
+	var rankingsJSON *string
 	err := r.pool.QueryRow(ctx, query, receiptToken).Scan(
-		&b.ID, &b.PollID, &b.VoterToken, &b.ChoiceIndex, &b.ReceiptToken, &b.Commitment, &b.CastAt,
+		&b.ID, &b.PollID, &b.VoterToken, &b.ChoiceIndex, &rankingsJSON,
+		&b.ReceiptToken, &b.Commitment, &b.CastAt,
 	)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("voter_repo: get ballot by receipt token: %w", err)
+	}
+	if rankingsJSON != nil {
+		if err := json.Unmarshal([]byte(*rankingsJSON), &b.Rankings); err != nil {
+			return nil, fmt.Errorf("voter_repo: unmarshal rankings: %w", err)
+		}
 	}
 	return b, nil
 }

@@ -5,12 +5,15 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/tpt-nz/tpt-voter-portal-nz/internal/models"
 	"github.com/tpt-nz/tpt-voter-portal-nz/internal/repository"
 )
@@ -18,13 +21,15 @@ import (
 // PollService handles poll creation, voting, and ballot management.
 type PollService struct {
 	repo   *repository.VoterRepository
+	hub    *TallyHub
 	logger *slog.Logger
 }
 
 // NewPollService creates a new poll service.
-func NewPollService(repo *repository.VoterRepository, logger *slog.Logger) *PollService {
+func NewPollService(repo *repository.VoterRepository, hub *TallyHub, logger *slog.Logger) *PollService {
 	return &PollService{
 		repo:   repo,
+		hub:    hub,
 		logger: logger.With("service", "poll"),
 	}
 }
@@ -41,17 +46,22 @@ func (s *PollService) CreatePoll(ctx context.Context, req *models.CreatePollRequ
 		return nil, fmt.Errorf("poll: generate salt: %w", err)
 	}
 
+	bt := req.BallotType
+	if bt == "" {
+		bt = models.BallotTypeFPTP
+	}
+
 	poll := &models.Poll{
 		Title:       req.Title,
 		Description: req.Description,
 		Options:     req.Options,
+		BallotType:  bt,
 		Status:      models.PollStatusDraft,
 		PollSalt:    salt,
 		OpensAt:     req.OpensAt,
 		ClosesAt:    req.ClosesAt,
 	}
 
-	// Automatically open the poll if OpensAt is in the past or now
 	if !req.OpensAt.After(time.Now()) {
 		poll.Status = models.PollStatusOpen
 	}
@@ -60,7 +70,7 @@ func (s *PollService) CreatePoll(ctx context.Context, req *models.CreatePollRequ
 		return nil, fmt.Errorf("poll: create: %w", err)
 	}
 
-	s.logger.InfoContext(ctx, "poll created", "pollID", poll.ID, "status", poll.Status)
+	s.logger.InfoContext(ctx, "poll created", "pollID", poll.ID, "status", poll.Status, "ballotType", poll.BallotType)
 	return poll, nil
 }
 
@@ -82,16 +92,18 @@ func (s *PollService) GetPollByID(ctx context.Context, id uuid.UUID) (*models.Po
 	return poll, nil
 }
 
-// CastBallot records an anonymous vote for a poll.
+// CastBallot records an anonymous vote for a poll. Supports both FPTP and
+// ranked-choice (IRV) ballot types.
 //
 // ZK deduplication design:
 //   - voter_token = sha256(flt_hash + poll_id + poll_salt) — unique per voter per poll, not reversible
 //   - receipt_token = random UUID — voter's personal proof; returned to them, stored publicly
 //   - commitment = sha256(voter_token + choice_str + receipt_token) — public audit anchor
-//   - The database UNIQUE(poll_id, voter_token) enforces one-vote-per-voter at the storage layer
+//     For ranked ballots, choice_str is the JSON-encoded rankings array.
+//   - UNIQUE(poll_id, voter_token) enforces one-vote-per-voter at the storage layer
 //
 // No FLT or PII is stored in the ballot table.
-func (s *PollService) CastBallot(ctx context.Context, flt string, pollID uuid.UUID, choiceIndex int) (*models.BallotReceipt, error) {
+func (s *PollService) CastBallot(ctx context.Context, flt string, pollID uuid.UUID, req *models.CastBallotRequest) (*models.BallotReceipt, error) {
 	poll, err := s.repo.GetPollByID(ctx, pollID)
 	if err != nil {
 		return nil, fmt.Errorf("poll: cast ballot: get poll: %w", err)
@@ -102,14 +114,10 @@ func (s *PollService) CastBallot(ctx context.Context, flt string, pollID uuid.UU
 	if poll.Status != models.PollStatusOpen {
 		return nil, fmt.Errorf("poll: cast ballot: poll is not open for voting")
 	}
-	if choiceIndex < 0 || choiceIndex >= len(poll.Options) {
-		return nil, fmt.Errorf("poll: cast ballot: choice index %d out of range [0, %d)", choiceIndex, len(poll.Options))
-	}
 
 	fltHash := FLTHash(flt)
 	voterToken := deriveVoterToken(fltHash, poll.ID.String(), poll.PollSalt)
 
-	// Check for existing vote before attempting insert (cleaner error message)
 	hasVoted, err := s.repo.HasVoted(ctx, pollID, voterToken)
 	if err != nil {
 		return nil, fmt.Errorf("poll: cast ballot: check has voted: %w", err)
@@ -119,26 +127,64 @@ func (s *PollService) CastBallot(ctx context.Context, flt string, pollID uuid.UU
 	}
 
 	receiptToken := uuid.New().String()
-	commitment := deriveCommitment(voterToken, strconv.Itoa(choiceIndex), receiptToken)
 
-	ballot := &models.Ballot{
-		PollID:       pollID,
-		VoterToken:   voterToken,
-		ChoiceIndex:  choiceIndex,
-		ReceiptToken: receiptToken,
-		Commitment:   commitment,
+	var ballot *models.Ballot
+
+	if poll.BallotType == models.BallotTypeRanked {
+		if err := validateRankings(req.Rankings, len(poll.Options)); err != nil {
+			return nil, fmt.Errorf("poll: cast ballot: %w", err)
+		}
+		rankingsJSON, _ := json.Marshal(req.Rankings)
+		commitment := deriveCommitment(voterToken, string(rankingsJSON), receiptToken)
+		ballot = &models.Ballot{
+			PollID:       pollID,
+			VoterToken:   voterToken,
+			ChoiceIndex:  -1,
+			Rankings:     req.Rankings,
+			ReceiptToken: receiptToken,
+			Commitment:   commitment,
+		}
+	} else {
+		if req.ChoiceIndex < 0 || req.ChoiceIndex >= len(poll.Options) {
+			return nil, fmt.Errorf("poll: cast ballot: choice index %d out of range [0, %d)", req.ChoiceIndex, len(poll.Options))
+		}
+		commitment := deriveCommitment(voterToken, strconv.Itoa(req.ChoiceIndex), receiptToken)
+		ballot = &models.Ballot{
+			PollID:       pollID,
+			VoterToken:   voterToken,
+			ChoiceIndex:  req.ChoiceIndex,
+			ReceiptToken: receiptToken,
+			Commitment:   commitment,
+		}
 	}
 
 	if err := s.repo.InsertBallot(ctx, ballot); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return nil, fmt.Errorf("poll: cast ballot: voter has already voted in this poll")
+		}
 		return nil, fmt.Errorf("poll: cast ballot: insert: %w", err)
 	}
 
-	s.logger.InfoContext(ctx, "ballot cast", "pollID", pollID, "choiceIndex", choiceIndex)
+	s.logger.InfoContext(ctx, "ballot cast", "pollID", pollID, "ballotType", poll.BallotType)
+
+	// Notify SSE subscribers (non-blocking via hub)
+	if s.hub != nil {
+		// Count ballots for live event without blocking the response path
+		go func() {
+			count, _ := s.repo.CountVotesByPoll(context.Background(), pollID)
+			total := 0
+			for _, n := range count {
+				total += n
+			}
+			s.hub.Publish(models.TallyEvent{PollID: pollID.String(), TotalVotes: total})
+		}()
+	}
 
 	return &models.BallotReceipt{
 		ReceiptToken: receiptToken,
 		PollID:       pollID,
-		ChoiceIndex:  choiceIndex,
+		ChoiceIndex:  ballot.ChoiceIndex,
 		CastAt:       ballot.CastAt,
 	}, nil
 }
@@ -187,6 +233,23 @@ func generateSalt() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+func validateRankings(rankings []int, numOptions int) error {
+	if len(rankings) == 0 {
+		return fmt.Errorf("rankings must not be empty for a ranked-choice poll")
+	}
+	seen := make(map[int]bool, len(rankings))
+	for _, idx := range rankings {
+		if idx < 0 || idx >= numOptions {
+			return fmt.Errorf("ranking index %d out of range [0, %d)", idx, numOptions)
+		}
+		if seen[idx] {
+			return fmt.Errorf("duplicate ranking index %d", idx)
+		}
+		seen[idx] = true
+	}
+	return nil
 }
 
 func validateCreatePollRequest(req *models.CreatePollRequest) error {

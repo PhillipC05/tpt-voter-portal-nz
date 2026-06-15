@@ -141,9 +141,13 @@ export default function ResultsPage() {
       </div>
 
       {tab === "results" ? (
-        <ResultsChart tally={tally} />
+        <ResultsChart tally={tally} pollId={pollId} />
       ) : (
-        <AuditProofDisplay pollId={pollId} auditRoot={tally.auditRoot} />
+        <AuditProofDisplay
+          pollId={pollId}
+          auditRoot={tally.auditRoot}
+          pollOptions={tally.poll.options}
+        />
       )}
     </div>
   );

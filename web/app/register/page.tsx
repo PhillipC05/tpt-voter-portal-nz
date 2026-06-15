@@ -27,8 +27,8 @@ export default function RegisterPage() {
         if (!res.ok) throw new Error("Failed to load status");
         const data = await res.json();
         setRegStatus(data);
-      } catch {
-        // Not signed in or error — handled below
+      } catch (err: unknown) {
+        setError(err instanceof Error ? err.message : "Failed to check registration status.");
       } finally {
         setLoading(false);
       }

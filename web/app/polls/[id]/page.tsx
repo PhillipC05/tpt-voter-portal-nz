@@ -145,7 +145,7 @@ export default function PollPage() {
               View Results →
             </a>
             <a
-              href={`/polls/${poll.id}/verify?receipt=${receipt.receiptToken}`}
+              href={`/results/${poll.id}?receipt=${receipt.receiptToken}`}
               className="text-sm text-blue-600 hover:text-blue-800 font-medium"
             >
               Verify Your Vote →

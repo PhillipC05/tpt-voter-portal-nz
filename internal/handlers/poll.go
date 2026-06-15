@@ -18,7 +18,7 @@ type PollService interface {
 	CreatePoll(ctx context.Context, req *models.CreatePollRequest) (*models.Poll, error)
 	GetActivePolls(ctx context.Context) ([]models.Poll, error)
 	GetPollByID(ctx context.Context, id uuid.UUID) (*models.Poll, error)
-	CastBallot(ctx context.Context, flt string, pollID uuid.UUID, choiceIndex int) (*models.BallotReceipt, error)
+	CastBallot(ctx context.Context, flt string, pollID uuid.UUID, req *models.CastBallotRequest) (*models.BallotReceipt, error)
 	GetVoterReceipt(ctx context.Context, flt string, pollID uuid.UUID) (*models.BallotReceipt, error)
 }
 
@@ -125,7 +125,7 @@ func (h *PollHandler) CastBallot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	receipt, err := h.svc.CastBallot(r.Context(), identity.FLT, id, req.ChoiceIndex)
+	receipt, err := h.svc.CastBallot(r.Context(), identity.FLT, id, &req)
 	if err != nil {
 		h.logger.ErrorContext(r.Context(), "cast ballot failed", "error", err)
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("ballot rejected: %s", err.Error())})
